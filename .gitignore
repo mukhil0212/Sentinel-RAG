@@ -22,3 +22,6 @@ out/
 
 # Sentinel
 .sentinel/
+
+# Env secrets
+backend/.env
