@@ -1,0 +1,1 @@
+"""Sentinel-RAG backend package."""
