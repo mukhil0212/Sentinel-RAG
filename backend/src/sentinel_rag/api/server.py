@@ -108,14 +108,24 @@ def _sse_json(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\n" + _sse_data(json.dumps(payload, default=str))
 
 
+def _derive_tool_name(raw_type: str | None, name: str | None) -> str | None:
+    """Derive tool name from type if not explicitly provided."""
+    if name:
+        return name
+    # Some hosted tools don't have a "name" field, derive from type
+    type_to_name = {
+        "apply_patch_call": "apply_patch",
+        "web_search_call": "web_search",
+        "file_search_call": "file_search",
+    }
+    return type_to_name.get(raw_type or "", name)
+
+
 def _tool_call_payload(item: ToolCallItem) -> dict[str, Any]:
     raw = item.raw_item
     if isinstance(raw, dict):
         raw_type = raw.get("type")
-        # apply_patch calls don't have a "name" field, derive it from the type
-        name = raw.get("name")
-        if not name and raw_type == "apply_patch_call":
-            name = "apply_patch"
+        name = _derive_tool_name(raw_type, raw.get("name"))
         return {
             "type": raw_type,
             "name": name,
@@ -123,9 +133,7 @@ def _tool_call_payload(item: ToolCallItem) -> dict[str, Any]:
             "arguments": raw.get("arguments"),
         }
     raw_type = getattr(raw, "type", None)
-    name = getattr(raw, "name", None)
-    if not name and raw_type == "apply_patch_call":
-        name = "apply_patch"
+    name = _derive_tool_name(raw_type, getattr(raw, "name", None))
     return {
         "type": raw_type,
         "name": name,
