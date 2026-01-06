@@ -86,7 +86,7 @@ def build_agent(sandbox_root: Path, instructions: str = DEFAULT_INSTRUCTIONS) ->
 
 async def main() -> None:
     config = DEFAULT_CONFIG
-    sandbox = create_sandbox(config.repo_root, config.sandbox_root)
+    sandbox = create_sandbox(config.sandbox_root)
 
     demo_path = sandbox.root / "demo.txt"
     demo_path.write_text("status = broken\n", encoding="utf-8")

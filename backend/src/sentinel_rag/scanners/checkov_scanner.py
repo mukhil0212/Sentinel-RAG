@@ -1,10 +1,62 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
+import shutil
+import sys
 from pathlib import Path
 
 from sentinel_rag.scanners.command_runner import CommandResult, run_command
 from sentinel_rag.scanners.models import Finding
+
+
+def _resolve_checkov_command() -> list[str]:
+    """Return a runnable Checkov command, even when PATH is not configured.
+
+    Preference order:
+    0) `SENTINEL_RAG_CHECKOV_BIN` explicit override
+    1) `checkov` found on PATH
+    2) `checkov` next to the running Python interpreter (venv-local bin/Scripts)
+    3) repo-local virtualenv script (common in local dev)
+    4) `python -m checkov` if the module is importable
+    """
+    override = os.environ.get("SENTINEL_RAG_CHECKOV_BIN")
+    if override:
+        return [override]
+
+    on_path = shutil.which("checkov")
+    if on_path:
+        return [on_path]
+
+    # In venvs, console scripts live next to sys.executable.
+    exe_dir = Path(sys.executable).resolve().parent
+    candidate = exe_dir / "checkov"
+    if candidate.exists():
+        return [str(candidate)]
+    candidate_win = exe_dir / "checkov.exe"
+    if candidate_win.exists():
+        return [str(candidate_win)]
+
+    # Local dev convenience: if the repo contains a venv, use it.
+    # This helps when the API is started outside the venv but Checkov is installed inside it.
+    backend_dir = Path(__file__).resolve().parents[3]  # .../backend
+    repo_dir = backend_dir.parent
+    dev_candidates = [
+        backend_dir / ".venv" / "bin" / "checkov",
+        backend_dir / ".venv" / "Scripts" / "checkov.exe",
+        repo_dir / ".venv" / "bin" / "checkov",
+        repo_dir / ".venv" / "Scripts" / "checkov.exe",
+    ]
+    for p in dev_candidates:
+        if p.exists():
+            return [str(p)]
+
+    # Last resort: run as module if installed but scripts weren't exposed.
+    if importlib.util.find_spec("checkov") is not None:
+        return [sys.executable, "-m", "checkov"]
+
+    return ["checkov"]
 
 
 def _severity_from_checkov(severity: str | None) -> str:
@@ -23,6 +75,22 @@ def _severity_from_checkov(severity: str | None) -> str:
     return "info"
 
 
+def _description_from_checkov(check: dict) -> str:
+    check_name = check.get("check_name") or check.get("check") or "Unknown check"
+    check_result = check.get("check_result")
+    if isinstance(check_result, dict):
+        evaluated_keys = check_result.get("evaluated_keys")
+        if isinstance(evaluated_keys, list):
+            keys = [str(k) for k in evaluated_keys if k is not None]
+            if len(keys) > 20:
+                keys = [*keys[:20], "... (truncated)"]
+            if keys:
+                return "Evaluated keys:\n" + "\n".join(f"- {k}" for k in keys)
+
+    message = check.get("message") or check.get("description")
+    return str(message or check_name)
+
+
 def scan_checkov(sandbox_root: Path, file_path: str | None = None) -> tuple[list[Finding], CommandResult]:
     """Run Checkov on the sandbox and return normalized findings.
 
@@ -34,7 +102,7 @@ def scan_checkov(sandbox_root: Path, file_path: str | None = None) -> tuple[list
         file_path: Optional specific file to scan (relative to sandbox)
     """
     cmd = [
-        "checkov",
+        *_resolve_checkov_command(),
         "--output", "json",
         "--compact",
         "--quiet",
@@ -76,7 +144,7 @@ def scan_checkov(sandbox_root: Path, file_path: str | None = None) -> tuple[list
 
         for check in failed_checks:
             check_id = check.get("check_id", "unknown")
-            check_name = check.get("check", "Unknown check")
+            check_name = check.get("check_name") or check.get("check") or "Unknown check"
             file_path_result = check.get("file_path", "")
             file_line_range = check.get("file_line_range", [])
             guideline = check.get("guideline", "")
@@ -99,10 +167,8 @@ def scan_checkov(sandbox_root: Path, file_path: str | None = None) -> tuple[list
                     tool="checkov",
                     severity=_severity_from_checkov(severity),
                     title=f"{check_id}: {check_name}",
-                    description=check.get("check_result", {}).get("evaluated_keys", [])
-                                if isinstance(check.get("check_result"), dict)
-                                else str(check_name),
-                    recommendation=guideline or f"See Checkov docs for {check_id}",
+                    description=_description_from_checkov(check),
+                    recommendation=str(guideline) if guideline else f"See Checkov docs for {check_id}",
                     file_path=file_path_result or None,
                     line=int(line) if line else None,
                     raw=check,

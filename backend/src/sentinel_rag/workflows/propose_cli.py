@@ -85,7 +85,7 @@ def seed_demo_files(sandbox_root: Path) -> None:
 
 async def main() -> None:
     config = DEFAULT_CONFIG
-    sandbox = create_sandbox(config.repo_root, config.sandbox_root)
+    sandbox = create_sandbox(config.sandbox_root)
     seed_demo_files(sandbox.root)
 
     agent = build_agent(sandbox.root)

@@ -4,6 +4,9 @@ from typing import Any
 import uuid
 from pathlib import Path
 import json
+import shutil
+import sys
+import os
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -14,6 +17,7 @@ from pydantic import BaseModel
 from sentinel_rag.config import DEFAULT_CONFIG
 from sentinel_rag.sandbox import create_sandbox
 from sentinel_rag.agents.agent_service import build_agent
+from sentinel_rag.scanners.checkov_scanner import _resolve_checkov_command
 from agents import Runner
 from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
 from agents.items import ToolCallItem, ToolCallOutputItem, ReasoningItem
@@ -136,12 +140,35 @@ def _tool_output_payload(item: ToolCallOutputItem) -> dict[str, Any]:
 async def create_session() -> SessionCreateResponse:
     """Create a sandboxed session and return its ID."""
     session_id = store.create_session().session_id if store else uuid.uuid4().hex
-    sandbox = create_sandbox(DEFAULT_CONFIG.repo_root, DEFAULT_CONFIG.sandbox_root)
+    sandbox = create_sandbox(DEFAULT_CONFIG.sandbox_root)
     SESSIONS[session_id] = {
         "sandbox_root": str(sandbox.root),
         "previous_response_id": None,
     }
     return SessionCreateResponse(session_id=session_id)
+
+
+@app.get("/api/debug/env")
+async def debug_env() -> dict[str, Any]:
+    """Lightweight runtime diagnostics (intended for local dev)."""
+    try:
+        import sentinel_rag as sentinel_rag_pkg
+        sentinel_rag_file = getattr(sentinel_rag_pkg, "__file__", None)
+    except Exception:
+        sentinel_rag_file = None
+
+    resolved = _resolve_checkov_command()
+    resolved_path = resolved[0] if resolved else None
+    return {
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "sys_executable": sys.executable,
+        "cwd": str(Path.cwd()),
+        "sentinel_rag_file": sentinel_rag_file,
+        "checkov_which": shutil.which("checkov"),
+        "checkov_resolved": resolved,
+        "checkov_resolved_exists": bool(resolved_path and Path(resolved_path).exists()),
+    }
 
 
 @app.post("/api/chat")

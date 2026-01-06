@@ -2,15 +2,20 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import type { ComponentPropsWithoutRef } from "react";
 import remarkGfm from "remark-gfm";
 
-const DEFAULT_API_BASE = "http://localhost:8000";
+const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 
 type ChatMessage = {
   id: string;
   role: "user" | "assistant" | "tool" | "reasoning";
   content: string;
   toolName?: string;
+  toolCallId?: string;
+  toolArgs?: string;
+  toolOutput?: string;
+  toolStatus?: "running" | "done";
 };
 
 type FileNode = {
@@ -21,6 +26,68 @@ type FileNode = {
 };
 
 const uid = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+type MarkdownCodeProps = ComponentPropsWithoutRef<"code"> & { inline?: boolean };
+
+const Markdown = ({ content }: { content: string }) => (
+  <div className="text-[13px] leading-relaxed text-[#d4d4d4]">
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        p: ({ children }) => <p className="my-2">{children}</p>,
+        h1: ({ children }) => <h1 className="my-3 text-lg font-semibold">{children}</h1>,
+        h2: ({ children }) => <h2 className="my-3 text-base font-semibold">{children}</h2>,
+        h3: ({ children }) => <h3 className="my-2 text-sm font-semibold">{children}</h3>,
+        ul: ({ children }) => <ul className="my-2 list-disc pl-5">{children}</ul>,
+        ol: ({ children }) => <ol className="my-2 list-decimal pl-5">{children}</ol>,
+        li: ({ children }) => <li className="my-1">{children}</li>,
+        a: ({ children, href }) => (
+          <a
+            className="text-[#4fc1ff] underline underline-offset-2"
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+          >
+            {children}
+          </a>
+        ),
+        blockquote: ({ children }) => (
+          <blockquote className="my-2 border-l-2 border-[#3c3c3c] pl-3 text-[#9da1a6]">
+            {children}
+          </blockquote>
+        ),
+        code: ({ children, inline, ...rest }: MarkdownCodeProps) =>
+          inline ? (
+            <code className="rounded bg-[#1e1e1e] px-1 py-0.5 font-mono text-[12px] text-[#dcdcaa]">
+              {children}
+            </code>
+          ) : (
+            <code className="font-mono text-[12px] text-[#d4d4d4]" {...rest}>
+              {children}
+            </code>
+          ),
+        pre: ({ children }) => (
+          <pre className="my-2 max-h-80 overflow-auto rounded border border-[#3c3c3c] bg-[#1e1e1e] p-3 font-mono text-[12px] text-[#d4d4d4]">
+            {children}
+          </pre>
+        ),
+        table: ({ children }) => (
+          <div className="my-2 overflow-auto rounded border border-[#3c3c3c]">
+            <table className="w-full border-collapse text-[12px]">{children}</table>
+          </div>
+        ),
+        th: ({ children }) => (
+          <th className="border-b border-[#3c3c3c] bg-[#1e1e1e] p-2 text-left font-semibold">
+            {children}
+          </th>
+        ),
+        td: ({ children }) => <td className="border-b border-[#2d2d2d] p-2 align-top">{children}</td>,
+      }}
+    >
+      {content}
+    </ReactMarkdown>
+  </div>
+);
 
 // Resizable divider component
 const ResizeDivider = ({
@@ -85,10 +152,10 @@ const parseSseEvents = (
   buffer: string,
   handlers: {
     onText: (text: string) => void;
-    onToolCall: (name: string, args: string) => void;
-    onToolOutput: (output: string) => void;
+    onToolCall: (payload: { name: string; args: string; callId?: string }) => void;
+    onToolOutput: (payload: { output: string; callId?: string }) => void;
     onReasoning: (summary: string) => void;
-    onDone: () => void;
+    onDone: (payload?: { final_output?: string; last_response_id?: string }) => void;
   }
 ) => {
   const parts = buffer.split("\n\n");
@@ -111,11 +178,19 @@ const parseSseEvents = (
     const data = dataLines.join("\n");
 
     if (eventName === "done") {
-      handlers.onDone();
+      try {
+        handlers.onDone(JSON.parse(data));
+      } catch {
+        handlers.onDone();
+      }
     } else if (eventName === "tool_called") {
       try {
         const payload = JSON.parse(data);
-        handlers.onToolCall(payload.name || "tool", payload.arguments || "");
+        handlers.onToolCall({
+          name: payload.name || "tool",
+          args: payload.arguments || "",
+          callId: payload.call_id || undefined,
+        });
       } catch {}
     } else if (eventName === "tool_output") {
       try {
@@ -123,7 +198,10 @@ const parseSseEvents = (
         const output = typeof payload.output === "string"
           ? payload.output
           : JSON.stringify(payload.output, null, 2);
-        handlers.onToolOutput(output);
+        handlers.onToolOutput({
+          output,
+          callId: payload.call_id || undefined,
+        });
       } catch {}
     } else if (eventName === "reasoning") {
       try {
@@ -161,13 +239,17 @@ const FileTree = ({
           <button
             onClick={() => {
               if (node.is_dir) {
-                setExpanded((prev) => {
-                  const next = new Set(prev);
-                  next.has(node.path) ? next.delete(node.path) : next.add(node.path);
-                  return next;
-                });
-              } else {
-                onSelect(node.path);
+	                setExpanded((prev) => {
+	                  const next = new Set(prev);
+	                  if (next.has(node.path)) {
+	                    next.delete(node.path);
+	                  } else {
+	                    next.add(node.path);
+	                  }
+	                  return next;
+	                });
+	              } else {
+	                onSelect(node.path);
               }
             }}
             className={`flex w-full items-center gap-1.5 px-2 py-1 text-left hover:bg-[#2a2a2a] ${
@@ -263,7 +345,7 @@ export default function Home() {
 
   // Pane widths (resizable)
   const [leftPaneWidth, setLeftPaneWidth] = useState(240);
-  const [rightPaneWidth, setRightPaneWidth] = useState(380);
+  const [rightPaneWidth, setRightPaneWidth] = useState(300);
 
   // File state
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
@@ -280,6 +362,7 @@ export default function Home() {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const streamBuffer = useRef("");
   const lastSyncedContent = useRef("");
+  const toolMessageIdsByCallId = useRef<Map<string, string>>(new Map());
 
   // Resize handlers
   const handleLeftResize = useCallback((delta: number) => {
@@ -287,15 +370,15 @@ export default function Home() {
   }, []);
 
   const handleRightResize = useCallback((delta: number) => {
-    setRightPaneWidth((w) => Math.max(280, Math.min(600, w + delta)));
+    setRightPaneWidth((w) => Math.max(240, Math.min(460, w + delta)));
   }, []);
 
   // Auto-sync
   const debouncedContent = useDebounce(fileContent, 800);
 
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    chatEndRef.current?.scrollIntoView({ behavior: isStreaming ? "auto" : "smooth" });
+  }, [messages, isStreaming]);
 
   // Refresh file tree
   const refreshFiles = useCallback(async () => {
@@ -400,8 +483,7 @@ export default function Home() {
     setIsStreaming(true);
     streamBuffer.current = "";
 
-    const assistantId = uid();
-    setMessages((prev) => [...prev, { id: assistantId, role: "assistant", content: "" }]);
+    toolMessageIdsByCallId.current = new Map();
 
     try {
       const res = await fetch(`${apiBase}/api/chat`, {
@@ -414,6 +496,9 @@ export default function Home() {
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
+      let donePayload: { final_output?: string; last_response_id?: string } | undefined;
+      let gotDoneEvent = false;
+      let fullText = "";
 
       while (true) {
         const { value, done } = await reader.read();
@@ -422,21 +507,54 @@ export default function Home() {
         streamBuffer.current += decoder.decode(value, { stream: true });
         streamBuffer.current = parseSseEvents(streamBuffer.current, {
           onText: (text) => {
+            fullText += text;
+          },
+          onToolCall: ({ name, args, callId }) => {
+            const id = uid();
+            const key = callId || id;
+            toolMessageIdsByCallId.current.set(key, id);
+            setMessages((prev) => [
+              ...prev,
+              {
+                id,
+                role: "tool",
+                content: "",
+                toolName: name,
+                toolCallId: callId,
+                toolArgs: args,
+                toolStatus: "running",
+              },
+            ]);
+          },
+          onToolOutput: ({ output, callId }) => {
+            const key = callId;
+            const existingId = key ? toolMessageIdsByCallId.current.get(key) : undefined;
+            if (!existingId) {
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: uid(),
+                  role: "tool",
+                  content: "",
+                  toolName: "tool_output",
+                  toolCallId: callId,
+                  toolOutput: output,
+                  toolStatus: "done",
+                },
+              ]);
+              return;
+            }
             setMessages((prev) =>
-              prev.map((m) => (m.id === assistantId ? { ...m, content: m.content + text } : m))
+              prev.map((m) =>
+                m.id === existingId
+                  ? {
+                      ...m,
+                      toolOutput: output,
+                      toolStatus: "done",
+                    }
+                  : m
+              )
             );
-          },
-          onToolCall: (name, args) => {
-            setMessages((prev) => [
-              ...prev,
-              { id: uid(), role: "tool", content: args, toolName: name },
-            ]);
-          },
-          onToolOutput: (output) => {
-            setMessages((prev) => [
-              ...prev,
-              { id: uid(), role: "tool", content: output, toolName: "result" },
-            ]);
           },
           onReasoning: (summary) => {
             setMessages((prev) => [
@@ -444,19 +562,21 @@ export default function Home() {
               { id: uid(), role: "reasoning", content: summary },
             ]);
           },
-          onDone: async () => {
-            // Refresh files after agent might have modified them
-            await refreshFiles();
-            if (selectedFile) await readFile(selectedFile);
+          onDone: (payload) => {
+            gotDoneEvent = true;
+            donePayload = payload;
           },
         });
       }
+
+      const finalText = gotDoneEvent && donePayload?.final_output ? donePayload.final_output : fullText;
+      setMessages((prev) => [...prev, { id: uid(), role: "assistant", content: finalText || "[No response]" }]);
+
+      // Refresh files after agent might have modified them
+      await refreshFiles();
+      if (selectedFile) await readFile(selectedFile);
     } catch {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantId ? { ...m, content: m.content + "\n\n[Error: Connection failed]" } : m
-        )
-      );
+      setMessages((prev) => [...prev, { id: uid(), role: "assistant", content: "[Error: Connection failed]" }]);
     } finally {
       setIsStreaming(false);
     }
@@ -601,29 +721,74 @@ export default function Home() {
         <div className="flex-1 overflow-auto p-3 space-y-3">
           {messages.map((m) => {
             if (m.role === "reasoning") {
+              const preview =
+                m.content.length > 140 ? `${m.content.slice(0, 140).trimEnd()}…` : m.content;
               return (
-                <div key={m.id} className="rounded border border-[#4ec9b0]/30 bg-[#4ec9b0]/10 p-2">
-                  <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase text-[#4ec9b0] mb-1">
-                    <span className="inline-block w-2 h-2 rounded-full bg-[#4ec9b0] animate-pulse" />
-                    Thinking
-                  </div>
-                  <div className="text-[12px] text-[#4ec9b0]/80 italic whitespace-pre-wrap">
+                <details key={m.id} className="rounded border border-[#4ec9b0]/30 bg-[#4ec9b0]/10 p-2">
+                  <summary className="cursor-pointer list-none">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase text-[#4ec9b0]">
+                        <span className="inline-block h-2 w-2 rounded-full bg-[#4ec9b0]" />
+                        Thinking
+                      </div>
+                      <span className="rounded border border-[#4ec9b0]/30 bg-[#1e1e1e] px-2 py-0.5 text-[10px] text-[#4ec9b0]">
+                        View
+                      </span>
+                    </div>
+                    <div className="mt-1 max-h-10 overflow-hidden text-[12px] text-[#4ec9b0]/80 italic whitespace-pre-wrap">
+                      {preview}
+                    </div>
+                  </summary>
+                  <div className="mt-2 text-[12px] text-[#4ec9b0]/80 italic whitespace-pre-wrap">
                     {m.content}
                   </div>
-                </div>
+                </details>
               );
             }
 
             if (m.role === "tool") {
+              const toolTitle = m.toolName || "tool";
+              const statusLabel = m.toolStatus === "running" ? "Running…" : "View";
               return (
-                <div key={m.id} className="rounded border border-[#3c3c3c] bg-[#1e1e1e] p-2">
-                  <div className="text-[10px] font-semibold uppercase text-[#569cd6] mb-1">
-                    {m.toolName}
-                  </div>
-                  <pre className="text-[11px] text-[#9da1a6] whitespace-pre-wrap overflow-auto max-h-32">
-                    {m.content.slice(0, 500)}{m.content.length > 500 ? "..." : ""}
-                  </pre>
-                </div>
+                <details key={m.id} className="rounded border border-[#3c3c3c] bg-[#1e1e1e] p-2">
+                  <summary className="cursor-pointer list-none">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="text-[10px] font-semibold uppercase text-[#569cd6]">
+                        Tool: {toolTitle}
+                      </div>
+                      <span
+                        className={`rounded border px-2 py-0.5 text-[10px] ${
+                          m.toolStatus === "running"
+                            ? "border-[#3c3c3c] bg-[#252526] text-[#9da1a6]"
+                            : "border-[#3c3c3c] bg-[#252526] text-[#d4d4d4]"
+                        }`}
+                      >
+                        {statusLabel}
+                      </span>
+                    </div>
+                    {m.toolArgs && (
+                      <div className="mt-1 max-h-10 overflow-hidden text-[11px] text-[#9da1a6] whitespace-pre-wrap">
+                        {m.toolArgs}
+                      </div>
+                    )}
+                  </summary>
+                  {m.toolArgs && (
+                    <div className="mt-2">
+                      <div className="text-[10px] font-semibold uppercase text-[#9da1a6] mb-1">Input</div>
+                      <pre className="text-[11px] text-[#9da1a6] whitespace-pre-wrap overflow-auto max-h-40">
+                        {m.toolArgs}
+                      </pre>
+                    </div>
+                  )}
+                  {m.toolOutput && (
+                    <div className="mt-2">
+                      <div className="text-[10px] font-semibold uppercase text-[#9da1a6] mb-1">Output</div>
+                      <pre className="text-[11px] text-[#9da1a6] whitespace-pre-wrap overflow-auto max-h-56">
+                        {m.toolOutput}
+                      </pre>
+                    </div>
+                  )}
+                </details>
               );
             }
 
@@ -634,14 +799,19 @@ export default function Home() {
                   m.role === "user" ? "bg-[#094771] ml-8" : "bg-[#2d2d2d] mr-8"
                 }`}
               >
-                <div className="prose prose-invert prose-sm max-w-none">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
-                </div>
+                <Markdown content={m.content} />
               </div>
             );
           })}
           {isStreaming && (
-            <div className="text-xs text-[#9da1a6] animate-pulse">Thinking...</div>
+            <div className="flex items-center gap-2 text-xs text-[#9da1a6]">
+              <span className="inline-flex items-center gap-1">
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#9da1a6] [animation-delay:-0.2s]" />
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#9da1a6] [animation-delay:-0.1s]" />
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#9da1a6]" />
+              </span>
+              <span>Working…</span>
+            </div>
           )}
           <div ref={chatEndRef} />
         </div>
@@ -649,7 +819,7 @@ export default function Home() {
         <div className="border-t border-[#2d2d2d] p-3">
           <textarea
             className="w-full resize-none rounded border border-[#2d2d2d] bg-[#1e1e1e] p-2 text-sm text-[#d4d4d4] outline-none focus:border-[#007acc]"
-            rows={3}
+            rows={2}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {

@@ -35,7 +35,12 @@ def make_scan_tool(sandbox_root: Path):
         scanner_notes: list[str] = []
 
         # Run Checkov (primary security scanner)
-        checkov_findings, checkov_run = scan_checkov(sandbox_root, file_path)
+        checkov_target: str | None = None
+        if file_path:
+            target = (sandbox_root / file_path).resolve()
+            if target.exists() and target.is_dir():
+                checkov_target = file_path
+        checkov_findings, checkov_run = scan_checkov(sandbox_root, checkov_target)
         if checkov_run.exit_code not in (0, 1):  # 0=pass, 1=failures found
             scanner_notes.append(f"Checkov error (exit {checkov_run.exit_code}): {checkov_run.stderr[:200]}")
 
