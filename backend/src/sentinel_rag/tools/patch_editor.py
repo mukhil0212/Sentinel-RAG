@@ -1,25 +1,69 @@
 from __future__ import annotations
 
 from pathlib import Path
-import os
-
 import hashlib
+import json
+from typing import Any
 
 from agents import ApplyPatchTool, apply_diff
 from agents.editor import ApplyPatchOperation, ApplyPatchResult
 
 
+def _parse_unified_diff(diff: str) -> list[dict[str, Any]]:
+    """Parse a unified diff into structured line objects."""
+    lines = []
+    for line in diff.split("\n"):
+        if not line:
+            continue
+        if line.startswith("@@"):
+            # Hunk header - skip or mark as context
+            lines.append({"type": "hunk", "content": line})
+        elif line.startswith("+++") or line.startswith("---"):
+            # File headers - skip
+            continue
+        elif line.startswith("+"):
+            lines.append({"type": "add", "content": line[1:]})
+        elif line.startswith("-"):
+            lines.append({"type": "remove", "content": line[1:]})
+        else:
+            # Context line (starts with space or no prefix)
+            content = line[1:] if line.startswith(" ") else line
+            lines.append({"type": "context", "content": content})
+    return lines
+
+
+def _make_structured_result(
+    operation_type: str,
+    file_path: str,
+    diff: str,
+    old_content: str = "",
+    new_content: str = "",
+) -> ApplyPatchResult:
+    """Create an ApplyPatchResult with structured diff data for the frontend."""
+    action_word = {"create_file": "Created", "update_file": "Updated", "delete_file": "Deleted"}.get(
+        operation_type, "Modified"
+    )
+
+    structured_output = {
+        "message": f"{action_word} {file_path}",
+        "operation_type": operation_type,
+        "file_path": file_path,
+        "diff_lines": _parse_unified_diff(diff),
+        "old_content": old_content,
+        "new_content": new_content,
+    }
+
+    return ApplyPatchResult(output=json.dumps(structured_output))
+
+
 class WorkspaceEditor:
     """Apply apply_patch operations inside a sandbox workspace."""
 
-    def __init__(self, root: Path, auto_approve: bool) -> None:
+    def __init__(self, root: Path) -> None:
         self._root = root.resolve()
-        self._auto_approve = auto_approve or os.environ.get("APPLY_PATCH_AUTO_APPROVE") == "1"
-        self._approved: set[str] = set()
+        self._applied: set[str] = set()
 
     async def create_file(self, operation: ApplyPatchOperation) -> ApplyPatchResult:
-        # apply_diff turns a unified diff into file content (create mode).
-        self._require_approval(operation)
         target = self._resolve(operation.path, ensure_parent=True)
         diff = operation.diff or ""
         try:
@@ -27,26 +71,44 @@ class WorkspaceEditor:
         except TypeError:
             content = apply_diff("", diff, mode="create")
         target.write_text(content, encoding="utf-8")
-        return ApplyPatchResult(output=f"Created {operation.path}")
+        self._applied.add(self._fingerprint(operation))
+        return _make_structured_result(
+            operation_type="create_file",
+            file_path=operation.path,
+            diff=diff,
+            old_content="",
+            new_content=content,
+        )
 
     async def update_file(self, operation: ApplyPatchOperation) -> ApplyPatchResult:
-        # apply_diff transforms current content into patched content.
-        self._require_approval(operation)
         target = self._resolve(operation.path)
         original = target.read_text(encoding="utf-8")
         diff = operation.diff or ""
         patched = apply_diff(original, diff)
         target.write_text(patched, encoding="utf-8")
-        return ApplyPatchResult(output=f"Updated {operation.path}")
+        self._applied.add(self._fingerprint(operation))
+        return _make_structured_result(
+            operation_type="update_file",
+            file_path=operation.path,
+            diff=diff,
+            old_content=original,
+            new_content=patched,
+        )
 
     async def delete_file(self, operation: ApplyPatchOperation) -> ApplyPatchResult:
-        self._require_approval(operation)
         target = self._resolve(operation.path)
+        original = target.read_text(encoding="utf-8") if target.exists() else ""
         target.unlink(missing_ok=True)
-        return ApplyPatchResult(output=f"Deleted {operation.path}")
+        self._applied.add(self._fingerprint(operation))
+        return _make_structured_result(
+            operation_type="delete_file",
+            file_path=operation.path,
+            diff=operation.diff or "",
+            old_content=original,
+            new_content="",
+        )
 
     def _resolve(self, relative: str, ensure_parent: bool = False) -> Path:
-        # Enforce that all edits stay inside the sandbox root.
         candidate = Path(relative)
         target = candidate if candidate.is_absolute() else (self._root / candidate)
         target = target.resolve()
@@ -67,25 +129,8 @@ class WorkspaceEditor:
         hasher.update((operation.diff or "").encode("utf-8"))
         return hasher.hexdigest()
 
-    def _require_approval(self, operation: ApplyPatchOperation) -> None:
-        # De-duplicate prompts for identical operations.
-        fingerprint = self._fingerprint(operation)
-        if self._auto_approve or fingerprint in self._approved:
-            self._approved.add(fingerprint)
-            return
 
-        print("\n[apply_patch] approval required")
-        print(f"- type: {operation.type}")
-        print(f"- path: {operation.path}")
-        if operation.diff:
-            preview = operation.diff if len(operation.diff) < 400 else f"{operation.diff[:400]}…"
-            print("- diff preview:\n", preview)
-        answer = input("Proceed? [y/N] ").strip().lower()
-        if answer not in {"y", "yes"}:
-            raise RuntimeError("Apply patch operation rejected by user.")
-        self._approved.add(fingerprint)
-
-
-def make_apply_patch_tool(root: Path, auto_approve: bool = True) -> ApplyPatchTool:
-    editor = WorkspaceEditor(root, auto_approve)
+def make_apply_patch_tool(root: Path) -> ApplyPatchTool:
+    """Create an apply_patch tool bound to a sandbox workspace."""
+    editor = WorkspaceEditor(root)
     return ApplyPatchTool(editor=editor)
