@@ -91,7 +91,11 @@ def _description_from_checkov(check: dict) -> str:
     return str(message or check_name)
 
 
-def scan_checkov(sandbox_root: Path, file_path: str | None = None) -> tuple[list[Finding], CommandResult]:
+def scan_checkov(
+    sandbox_root: Path,
+    file_path: str | None = None,
+    frameworks: list[str] | None = None,
+) -> tuple[list[Finding], CommandResult]:
     """Run Checkov on the sandbox and return normalized findings.
 
     Checkov supports Terraform, CloudFormation, Kubernetes, Helm, ARM, and more.
@@ -100,6 +104,7 @@ def scan_checkov(sandbox_root: Path, file_path: str | None = None) -> tuple[list
     Args:
         sandbox_root: Path to the sandbox directory
         file_path: Optional specific file to scan (relative to sandbox)
+        frameworks: Optional Checkov frameworks to restrict scanning to
     """
     cmd = [
         *_resolve_checkov_command(),
@@ -107,6 +112,11 @@ def scan_checkov(sandbox_root: Path, file_path: str | None = None) -> tuple[list
         "--compact",
         "--quiet",
     ]
+
+    # If frameworks are set, Checkov will only scan those.
+    # Example: --framework terraform kubernetes
+    if frameworks:
+        cmd.extend(["--framework", *frameworks])
 
     if file_path:
         target = sandbox_root / file_path

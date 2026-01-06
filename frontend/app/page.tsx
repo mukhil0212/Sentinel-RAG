@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { ComponentPropsWithoutRef } from "react";
 import remarkGfm from "remark-gfm";
+import { DiffViewer, isDiffData } from "./components/DiffViewer";
+import { VscodeCodeEditor, VscodeDiffViewer } from "./components/VscodeEditor";
 
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 
@@ -16,6 +18,13 @@ type ChatMessage = {
   toolArgs?: string;
   toolOutput?: string;
   toolStatus?: "running" | "done";
+};
+
+type FileDiff = {
+  filePath: string;
+  oldContent: string;
+  newContent: string;
+  operationType: "create_file" | "update_file" | "delete_file";
 };
 
 type FileNode = {
@@ -359,10 +368,16 @@ export default function Home() {
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
 
+  // Active diff state for file viewer
+  const [activeDiff, setActiveDiff] = useState<FileDiff | null>(null);
+  const [lastDiffByPath, setLastDiffByPath] = useState<Record<string, FileDiff>>({});
+  const [lastDiff, setLastDiff] = useState<FileDiff | null>(null);
+
   const chatEndRef = useRef<HTMLDivElement>(null);
   const streamBuffer = useRef("");
   const lastSyncedContent = useRef("");
   const toolMessageIdsByCallId = useRef<Map<string, string>>(new Map());
+  const toolNamesByCallId = useRef<Map<string, string>>(new Map());
 
   // Resize handlers
   const handleLeftResize = useCallback((delta: number) => {
@@ -484,6 +499,7 @@ export default function Home() {
     streamBuffer.current = "";
 
     toolMessageIdsByCallId.current = new Map();
+    toolNamesByCallId.current = new Map();
 
     try {
       const res = await fetch(`${apiBase}/api/chat`, {
@@ -513,6 +529,7 @@ export default function Home() {
             const id = uid();
             const key = callId || id;
             toolMessageIdsByCallId.current.set(key, id);
+            toolNamesByCallId.current.set(key, name);
             setMessages((prev) => [
               ...prev,
               {
@@ -529,6 +546,26 @@ export default function Home() {
           onToolOutput: ({ output, callId }) => {
             const key = callId;
             const existingId = key ? toolMessageIdsByCallId.current.get(key) : undefined;
+            const toolName = key ? toolNamesByCallId.current.get(key) : undefined;
+
+            // Check if this is an apply_patch output with diff data
+            if (toolName === "apply_patch") {
+              const diffData = isDiffData(output);
+              if (diffData) {
+                const diff: FileDiff = {
+                  filePath: diffData.file_path,
+                  oldContent: diffData.old_content,
+                  newContent: diffData.new_content,
+                  operationType: diffData.operation_type,
+                };
+                setActiveDiff(diff);
+                setLastDiffByPath((prev) => ({ ...prev, [diff.filePath]: diff }));
+                setLastDiff(diff);
+                // Auto-select the file that was modified
+                setSelectedFile(diffData.file_path);
+              }
+            }
+
             if (!existingId) {
               setMessages((prev) => [
                 ...prev,
@@ -536,7 +573,7 @@ export default function Home() {
                   id: uid(),
                   role: "tool",
                   content: "",
-                  toolName: "tool_output",
+                  toolName: toolName || "tool_output",
                   toolCallId: callId,
                   toolOutput: output,
                   toolStatus: "done",
@@ -680,21 +717,60 @@ export default function Home() {
 
       {/* Center - Editor */}
       <main className="flex flex-1 flex-col min-w-0">
-        <div className="flex h-9 items-center border-b border-[#2d2d2d] bg-[#252526] px-4">
-          {selectedFile ? (
-            <span className="text-xs text-[#d4d4d4]">{selectedFile}</span>
-          ) : (
-            <span className="text-xs text-[#9da1a6]">No file selected</span>
-          )}
+        <div className="flex h-9 items-center justify-between border-b border-[#2d2d2d] bg-[#252526] px-4">
+          <div className="flex items-center gap-2">
+            {selectedFile ? (
+              <span className="text-xs text-[#d4d4d4]">{selectedFile}</span>
+            ) : (
+              <span className="text-xs text-[#9da1a6]">No file selected</span>
+            )}
+            {activeDiff && activeDiff.filePath === selectedFile && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-[#1f6feb]/30 text-[#58a6ff]">
+                Diff View
+              </span>
+            )}
+          </div>
+          {activeDiff && activeDiff.filePath === selectedFile ? (
+            <button
+              onClick={() => {
+                setActiveDiff(null);
+                // Reload file content to show the new state
+                if (selectedFile) readFile(selectedFile);
+              }}
+              className="text-[10px] px-2 py-1 rounded bg-[#238636] text-white hover:bg-[#2ea043]"
+            >
+              Accept & Close
+            </button>
+          ) : selectedFile && lastDiffByPath[selectedFile] ? (
+            <button
+              onClick={() => setActiveDiff(lastDiffByPath[selectedFile])}
+              className="text-[10px] px-2 py-1 rounded border border-[#3c3c3c] bg-[#1e1e1e] text-[#d4d4d4] hover:bg-[#2a2a2a]"
+              title="View the last changes applied by the agent"
+            >
+              View Changes
+            </button>
+          ) : lastDiff ? (
+            <button
+              onClick={() => {
+                setSelectedFile(lastDiff.filePath);
+                setActiveDiff(lastDiff);
+              }}
+              className="text-[10px] px-2 py-1 rounded border border-[#3c3c3c] bg-[#1e1e1e] text-[#d4d4d4] hover:bg-[#2a2a2a]"
+              title="View the most recent diff from the agent"
+            >
+              View Last Change
+            </button>
+          ) : null}
         </div>
-        <div className="flex-1 p-2">
-          {selectedFile ? (
-            <textarea
-              className="h-full w-full resize-none rounded border border-[#2d2d2d] bg-[#1e1e1e] p-3 font-mono text-sm text-[#d4d4d4] outline-none focus:border-[#007acc]"
-              value={fileContent}
-              onChange={(e) => setFileContent(e.target.value)}
-              spellCheck={false}
+        <div className="flex-1 overflow-hidden">
+          {activeDiff && activeDiff.filePath === selectedFile ? (
+            <VscodeDiffViewer
+              filePath={activeDiff.filePath}
+              original={activeDiff.oldContent}
+              modified={activeDiff.newContent}
             />
+          ) : selectedFile ? (
+            <VscodeCodeEditor filePath={selectedFile} value={fileContent} onChange={setFileContent} />
           ) : (
             <div className="flex h-full items-center justify-center text-sm text-[#9da1a6]">
               Create or select a file to edit
@@ -783,9 +859,17 @@ export default function Home() {
                   {m.toolOutput && (
                     <div className="mt-2">
                       <div className="text-[10px] font-semibold uppercase text-[#9da1a6] mb-1">Output</div>
-                      <pre className="text-[11px] text-[#9da1a6] whitespace-pre-wrap overflow-auto max-h-56">
-                        {m.toolOutput}
-                      </pre>
+                      {(() => {
+                        const diffData = isDiffData(m.toolOutput);
+                        if (diffData && m.toolName === "apply_patch") {
+                          return <DiffViewer data={diffData} />;
+                        }
+                        return (
+                          <pre className="text-[11px] text-[#9da1a6] whitespace-pre-wrap overflow-auto max-h-56">
+                            {m.toolOutput}
+                          </pre>
+                        );
+                      })()}
                     </div>
                   )}
                 </details>
