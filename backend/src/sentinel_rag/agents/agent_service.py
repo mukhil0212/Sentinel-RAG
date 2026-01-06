@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from agents import Agent, ModelSettings, Runner
 from sentinel_rag.config import DEFAULT_CONFIG
 from sentinel_rag.sandbox import create_sandbox
-from sentinel_rag.tools.file_tools import make_read_file_tool
+from sentinel_rag.tools.file_tools import make_list_files_tool, make_read_file_tool
 from sentinel_rag.tools.patch_editor import make_apply_patch_tool
 from sentinel_rag.tools.scan_tool import make_scan_tool
 
@@ -24,6 +24,7 @@ You are Sentinel-RAG, a friendly and conversational IaC security assistant.
 
 ## Tools Available
 - **scan_iac**: Run Checkov security scanner on IaC files
+- **list_files**: List files in the sandbox
 - **read_file**: Read file contents from the sandbox
 - **apply_patch**: Apply a unified diff patch to fix issues
 
@@ -78,6 +79,7 @@ def build_agent(sandbox_root: Path, instructions: str = DEFAULT_INSTRUCTIONS) ->
         ),
         tools=[
             make_scan_tool(sandbox_root),
+            make_list_files_tool(sandbox_root),
             make_read_file_tool(sandbox_root),
             make_apply_patch_tool(sandbox_root),
         ],
