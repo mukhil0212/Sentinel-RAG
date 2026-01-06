@@ -23,35 +23,36 @@ function getLanguageId(filePath: string | null): string {
 
 let monacoSetupStarted = false;
 async function setupMonaco(monaco: Monaco) {
-  // Register a couple of basic languages that aren't always enabled by default.
-  // This keeps Terraform/YAML readable without bringing in extra language plugins.
-  const registerBasic = async (id: string, modPath: string) => {
+  // Next.js bundlers cannot resolve variable-path dynamic imports reliably.
+  // Use static imports for a couple of basic languages so YAML/Terraform are readable.
+  const registerBasic = (id: string, language: unknown, conf?: unknown) => {
     if (monaco.languages.getLanguages().some((lang) => lang.id === id)) return;
-    try {
-      const mod = (await import(
-        /* webpackChunkName: "monaco-basic-lang" */ modPath
-      )) as { language?: unknown; conf?: unknown };
-      if (!mod?.language) return;
-      monaco.languages.register({ id });
-      monaco.languages.setMonarchTokensProvider(
+    monaco.languages.register({ id });
+    monaco.languages.setMonarchTokensProvider(
+      id,
+      language as Parameters<Monaco["languages"]["setMonarchTokensProvider"]>[1]
+    );
+    if (conf) {
+      monaco.languages.setLanguageConfiguration(
         id,
-        mod.language as Parameters<Monaco["languages"]["setMonarchTokensProvider"]>[1]
+        conf as Parameters<Monaco["languages"]["setLanguageConfiguration"]>[1]
       );
-      if (mod.conf) {
-        monaco.languages.setLanguageConfiguration(
-          id,
-          mod.conf as Parameters<Monaco["languages"]["setLanguageConfiguration"]>[1]
-        );
-      }
-    } catch {
-      // ignore: language remains plaintext
     }
   };
 
-  await Promise.all([
-    registerBasic("yaml", "monaco-editor/esm/vs/basic-languages/yaml/yaml"),
-    registerBasic("hcl", "monaco-editor/esm/vs/basic-languages/hcl/hcl"),
-  ]);
+  // Client-only imports to avoid SSR `window is not defined` errors.
+  try {
+    const [{ language: yamlLanguage, conf: yamlConf }, { language: hclLanguage, conf: hclConf }] =
+      await Promise.all([
+        import("monaco-editor/esm/vs/basic-languages/yaml/yaml"),
+        import("monaco-editor/esm/vs/basic-languages/hcl/hcl"),
+      ]);
+
+    registerBasic("yaml", yamlLanguage, yamlConf);
+    registerBasic("hcl", hclLanguage, hclConf);
+  } catch {
+    // ignore: languages remain plaintext
+  }
 }
 
 function ensureMonacoSetup(monaco: Monaco) {

@@ -501,6 +501,9 @@ export default function Home() {
     toolMessageIdsByCallId.current = new Map();
     toolNamesByCallId.current = new Map();
 
+    // Create a streaming message ID to update in real-time
+    const streamingMessageId = uid();
+
     try {
       const res = await fetch(`${apiBase}/api/chat`, {
         method: "POST",
@@ -515,6 +518,7 @@ export default function Home() {
       let donePayload: { final_output?: string; last_response_id?: string } | undefined;
       let gotDoneEvent = false;
       let fullText = "";
+      let hasAddedStreamingMessage = false;
 
       while (true) {
         const { value, done } = await reader.read();
@@ -524,6 +528,21 @@ export default function Home() {
         streamBuffer.current = parseSseEvents(streamBuffer.current, {
           onText: (text) => {
             fullText += text;
+            // Add streaming message on first text chunk
+            if (!hasAddedStreamingMessage) {
+              hasAddedStreamingMessage = true;
+              setMessages((prev) => [
+                ...prev,
+                { id: streamingMessageId, role: "assistant", content: fullText },
+              ]);
+            } else {
+              // Update the streaming message content in real-time
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === streamingMessageId ? { ...m, content: fullText } : m
+                )
+              );
+            }
           },
           onToolCall: ({ name, args, callId }) => {
             const id = uid();
@@ -607,7 +626,17 @@ export default function Home() {
       }
 
       const finalText = gotDoneEvent && donePayload?.final_output ? donePayload.final_output : fullText;
-      setMessages((prev) => [...prev, { id: uid(), role: "assistant", content: finalText || "[No response]" }]);
+
+      // Update existing streaming message or add new one if no text was streamed
+      if (hasAddedStreamingMessage) {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === streamingMessageId ? { ...m, content: finalText || "[No response]" } : m
+          )
+        );
+      } else {
+        setMessages((prev) => [...prev, { id: uid(), role: "assistant", content: finalText || "[No response]" }]);
+      }
 
       // Refresh files after agent might have modified them
       await refreshFiles();

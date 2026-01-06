@@ -108,18 +108,35 @@ def _sse_json(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\n" + _sse_data(json.dumps(payload, default=str))
 
 
+def _derive_tool_name(raw_type: str | None, name: str | None) -> str | None:
+    """Derive tool name from type if not explicitly provided."""
+    if name:
+        return name
+    # Some hosted tools don't have a "name" field, derive from type
+    type_to_name = {
+        "apply_patch_call": "apply_patch",
+        "web_search_call": "web_search",
+        "file_search_call": "file_search",
+    }
+    return type_to_name.get(raw_type or "", name)
+
+
 def _tool_call_payload(item: ToolCallItem) -> dict[str, Any]:
     raw = item.raw_item
     if isinstance(raw, dict):
+        raw_type = raw.get("type")
+        name = _derive_tool_name(raw_type, raw.get("name"))
         return {
-            "type": raw.get("type"),
-            "name": raw.get("name"),
+            "type": raw_type,
+            "name": name,
             "call_id": raw.get("call_id"),
             "arguments": raw.get("arguments"),
         }
+    raw_type = getattr(raw, "type", None)
+    name = _derive_tool_name(raw_type, getattr(raw, "name", None))
     return {
-        "type": getattr(raw, "type", None),
-        "name": getattr(raw, "name", None),
+        "type": raw_type,
+        "name": name,
         "call_id": getattr(raw, "call_id", None),
         "arguments": getattr(raw, "arguments", None),
     }
@@ -129,6 +146,13 @@ def _tool_output_payload(item: ToolCallOutputItem) -> dict[str, Any]:
     output = item.output
     if hasattr(output, "model_dump"):
         output = output.model_dump()
+    # Some Agents SDK tool outputs wrap a single string inside a dict (e.g. {"output": "..."}).
+    # Unwrap these so the frontend consistently receives plain strings for text tool outputs.
+    if isinstance(output, dict):
+        if set(output.keys()) == {"output"} and isinstance(output.get("output"), str):
+            output = output["output"]
+        elif set(output.keys()) == {"text"} and isinstance(output.get("text"), str):
+            output = output["text"]
     return {
         "type": getattr(item.raw_item, "type", None) if not isinstance(item.raw_item, dict) else item.raw_item.get("type"),
         "call_id": getattr(item.raw_item, "call_id", None) if not isinstance(item.raw_item, dict) else item.raw_item.get("call_id"),

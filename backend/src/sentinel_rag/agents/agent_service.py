@@ -4,10 +4,10 @@ import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 
-from agents import Agent, ModelSettings, Runner
+from agents import Agent, ModelSettings, Runner, WebSearchTool
 from sentinel_rag.config import DEFAULT_CONFIG
 from sentinel_rag.sandbox import create_sandbox
-from sentinel_rag.tools.file_tools import make_read_file_tool
+from sentinel_rag.tools.file_tools import make_list_files_tool, make_read_file_tool
 from sentinel_rag.tools.patch_editor import make_apply_patch_tool
 from sentinel_rag.tools.scan_tool import make_scan_tool
 
@@ -24,8 +24,10 @@ You are Sentinel-RAG, a friendly and conversational IaC security assistant.
 
 ## Tools Available
 - **scan_iac**: Run Checkov security scanner on IaC files
+- **list_files**: List files in the sandbox
 - **read_file**: Read file contents from the sandbox
 - **apply_patch**: Apply a unified diff patch to fix issues
+- **web_search**: Search the web for up-to-date security information, best practices, and documentation
 
 ## How to Help Users
 
@@ -50,6 +52,15 @@ When a user asks you to scan or fix their infrastructure code:
 - After fixing, ALWAYS rescan and report whether the issue was resolved
 - If there are multiple issues, offer to fix them one by one
 - Keep patches minimal and focused
+
+## When to Use Web Search
+Use `web_search` to find current information when:
+- Looking up the latest security best practices for AWS, Azure, GCP, or Kubernetes
+- Finding official documentation for Terraform, CloudFormation, or other IaC tools
+- Researching specific CVEs or security vulnerabilities
+- Getting up-to-date compliance requirements (CIS, SOC2, HIPAA, PCI-DSS)
+- Understanding new cloud provider features or deprecated configurations
+- Finding recommended remediation steps for specific Checkov check IDs
 
 ## Example Conversation Flow
 User: "scan my terraform files"
@@ -78,8 +89,10 @@ def build_agent(sandbox_root: Path, instructions: str = DEFAULT_INSTRUCTIONS) ->
         ),
         tools=[
             make_scan_tool(sandbox_root),
+            make_list_files_tool(sandbox_root),
             make_read_file_tool(sandbox_root),
             make_apply_patch_tool(sandbox_root),
+            WebSearchTool(),
         ],
     )
 
