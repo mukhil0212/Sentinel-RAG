@@ -1,33 +1,95 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 const DEFAULT_API_BASE = "http://localhost:8000";
 
-const promptWithFile = (message: string, fileName: string, fileContent: string) => {
-  if (!fileContent.trim()) {
-    return message;
-  }
-  return [
-    message,
-    "\n\n<FILE>",
-    `name: ${fileName || "main.tf"}`,
-    fileContent,
-    "</FILE>",
-  ].join("\n");
-};
-
 type ChatMessage = {
-  role: "user" | "assistant";
+  id: string;
+  role: "user" | "assistant" | "tool" | "reasoning";
   content: string;
+  toolName?: string;
 };
 
+type FileNode = {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  children?: FileNode[] | null;
+};
+
+const uid = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+// Resizable divider component
+const ResizeDivider = ({
+  onDrag,
+  direction,
+}: {
+  onDrag: (delta: number) => void;
+  direction: "left" | "right";
+}) => {
+  const [isDragging, setIsDragging] = useState(false);
+  const startX = useRef(0);
+
+  useEffect(() => {
+    if (!isDragging) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      const delta = e.clientX - startX.current;
+      startX.current = e.clientX;
+      onDrag(direction === "left" ? delta : -delta);
+    };
+
+    const handleMouseUp = () => setIsDragging(false);
+
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    return () => {
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [isDragging, onDrag, direction]);
+
+  return (
+    <div
+      onMouseDown={(e) => {
+        startX.current = e.clientX;
+        setIsDragging(true);
+      }}
+      className={`w-1 cursor-col-resize hover:bg-[#007acc] transition-colors ${
+        isDragging ? "bg-[#007acc]" : "bg-transparent"
+      }`}
+    />
+  );
+};
+
+// Debounce hook for auto-sync
+function useDebounce<T>(value: T, delay: number): T {
+  const [debouncedValue, setDebouncedValue] = useState<T>(value);
+  useEffect(() => {
+    const handler = setTimeout(() => setDebouncedValue(value), delay);
+    return () => clearTimeout(handler);
+  }, [value, delay]);
+  return debouncedValue;
+}
+
+// SSE parser
 const parseSseEvents = (
   buffer: string,
-  onData: (data: string) => void,
-  onDone: (payload: string) => void
+  handlers: {
+    onText: (text: string) => void;
+    onToolCall: (name: string, args: string) => void;
+    onToolOutput: (output: string) => void;
+    onReasoning: (summary: string) => void;
+    onDone: () => void;
+  }
 ) => {
   const parts = buffer.split("\n\n");
   const remaining = parts.pop() ?? "";
@@ -40,398 +102,577 @@ const parseSseEvents = (
     for (const line of lines) {
       if (line.startsWith("event:")) {
         eventName = line.replace("event:", "").trim();
-        continue;
-      }
-      if (line.startsWith("data:")) {
+      } else if (line.startsWith("data:")) {
         dataLines.push(line.slice(5));
       }
     }
 
-    if (!dataLines.length) {
-      continue;
-    }
+    if (!dataLines.length) continue;
+    const data = dataLines.join("\n");
 
     if (eventName === "done") {
-      onDone(dataLines.join("\n"));
-      continue;
+      handlers.onDone();
+    } else if (eventName === "tool_called") {
+      try {
+        const payload = JSON.parse(data);
+        handlers.onToolCall(payload.name || "tool", payload.arguments || "");
+      } catch {}
+    } else if (eventName === "tool_output") {
+      try {
+        const payload = JSON.parse(data);
+        const output = typeof payload.output === "string"
+          ? payload.output
+          : JSON.stringify(payload.output, null, 2);
+        handlers.onToolOutput(output);
+      } catch {}
+    } else if (eventName === "reasoning") {
+      try {
+        const payload = JSON.parse(data);
+        if (payload.summary) {
+          handlers.onReasoning(payload.summary);
+        }
+      } catch {}
+    } else {
+      handlers.onText(data);
     }
-
-    onData(dataLines.join("\n"));
   }
 
   return remaining;
 };
 
+// File tree component
+const FileTree = ({
+  nodes,
+  selectedPath,
+  onSelect,
+  depth = 0,
+}: {
+  nodes: FileNode[];
+  selectedPath: string | null;
+  onSelect: (path: string) => void;
+  depth?: number;
+}) => {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  return (
+    <div className="text-xs">
+      {nodes.map((node) => (
+        <div key={node.path}>
+          <button
+            onClick={() => {
+              if (node.is_dir) {
+                setExpanded((prev) => {
+                  const next = new Set(prev);
+                  next.has(node.path) ? next.delete(node.path) : next.add(node.path);
+                  return next;
+                });
+              } else {
+                onSelect(node.path);
+              }
+            }}
+            className={`flex w-full items-center gap-1.5 px-2 py-1 text-left hover:bg-[#2a2a2a] ${
+              selectedPath === node.path ? "bg-[#094771]" : ""
+            }`}
+            style={{ paddingLeft: `${depth * 12 + 8}px` }}
+          >
+            <span className="text-[#9da1a6] text-[10px]">
+              {node.is_dir ? (expanded.has(node.path) ? "▼" : "▶") : "·"}
+            </span>
+            <span className={node.is_dir ? "text-[#dcdc9d]" : "text-[#d4d4d4]"}>
+              {node.name}
+            </span>
+          </button>
+          {node.is_dir && node.children && expanded.has(node.path) && (
+            <FileTree nodes={node.children} selectedPath={selectedPath} onSelect={onSelect} depth={depth + 1} />
+          )}
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// Test files
+const TEST_FILES: Record<string, { name: string; content: string }> = {
+  s3: {
+    name: "s3_bucket.tf",
+    content: `resource "aws_s3_bucket" "data" {
+  bucket = "my-data-bucket"
+}
+
+resource "aws_s3_bucket_acl" "data" {
+  bucket = aws_s3_bucket.data.id
+  acl    = "public-read"
+}
+
+resource "aws_s3_bucket_public_access_block" "data" {
+  bucket = aws_s3_bucket.data.id
+  block_public_acls       = false
+  block_public_policy     = false
+  ignore_public_acls      = false
+  restrict_public_buckets = false
+}
+`,
+  },
+  sg: {
+    name: "security_group.tf",
+    content: `resource "aws_security_group" "web" {
+  name        = "web-sg"
+  description = "Allow web traffic"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    description = "SSH from anywhere"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+`,
+  },
+  rds: {
+    name: "rds.tf",
+    content: `resource "aws_db_instance" "main" {
+  identifier           = "main-db"
+  allocated_storage    = 20
+  engine               = "mysql"
+  engine_version       = "8.0"
+  instance_class       = "db.t3.micro"
+  db_name              = "mydb"
+  username             = "admin"
+  password             = "password123"
+  skip_final_snapshot  = true
+  publicly_accessible  = true
+  storage_encrypted    = false
+}
+`,
+  },
+};
+
 export default function Home() {
-  const [apiBase, setApiBase] = useState(DEFAULT_API_BASE);
+  const [apiBase] = useState(DEFAULT_API_BASE);
+  const [status, setStatus] = useState("Connecting...");
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [fileName, setFileName] = useState("main.tf");
+
+  // Pane widths (resizable)
+  const [leftPaneWidth, setLeftPaneWidth] = useState(240);
+  const [rightPaneWidth, setRightPaneWidth] = useState(380);
+
+  // File state
+  const [fileTree, setFileTree] = useState<FileNode[]>([]);
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [fileContent, setFileContent] = useState("");
-  const [includeFile, setIncludeFile] = useState(true);
-  const [input, setInput] = useState("");
+  const [newFileName, setNewFileName] = useState("");
+  const [showNewFile, setShowNewFile] = useState(false);
+
+  // Chat state
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [lastDiff, setLastDiff] = useState<string | null>(null);
-  const [rejectionReason, setRejectionReason] = useState("");
-  const [status, setStatus] = useState("Creating session...");
+  const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
+
+  const chatEndRef = useRef<HTMLDivElement>(null);
   const streamBuffer = useRef("");
-  const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const lastSyncedContent = useRef("");
+
+  // Resize handlers
+  const handleLeftResize = useCallback((delta: number) => {
+    setLeftPaneWidth((w) => Math.max(160, Math.min(400, w + delta)));
+  }, []);
+
+  const handleRightResize = useCallback((delta: number) => {
+    setRightPaneWidth((w) => Math.max(280, Math.min(600, w + delta)));
+  }, []);
+
+  // Auto-sync
+  const debouncedContent = useDebounce(fileContent, 800);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, isStreaming]);
+  }, [messages]);
 
-  useEffect(() => {
-    let isMounted = true;
-
-    const bootstrap = async () => {
-      try {
-        setStatus("Creating session...");
-        const response = await fetch(`${apiBase}/api/session`, {
-          method: "POST",
-        });
-        if (!response.ok) {
-          throw new Error("Failed to create session");
-        }
-        const data = (await response.json()) as { session_id: string };
-        if (isMounted) {
-          setSessionId(data.session_id);
-          setStatus("Session ready");
-        }
-      } catch (error) {
-        if (isMounted) {
-          setStatus("Session error - check API base URL");
-        }
+  // Refresh file tree
+  const refreshFiles = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      const res = await fetch(`${apiBase}/api/file/list`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setFileTree(data.files ?? []);
       }
-    };
+    } catch {}
+  }, [apiBase, sessionId]);
 
-    bootstrap();
-    return () => {
-      isMounted = false;
-    };
-  }, [apiBase]);
+  // Save file
+  const saveFile = useCallback(
+    async (path: string, content: string) => {
+      if (!sessionId) return;
+      try {
+        await fetch(`${apiBase}/api/file/upsert`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId, path, content }),
+        });
+        lastSyncedContent.current = content;
+        await refreshFiles();
+      } catch {}
+    },
+    [apiBase, sessionId, refreshFiles]
+  );
 
-  const canSend = useMemo(() => {
-    return Boolean(sessionId) && !isStreaming && input.trim().length > 0;
-  }, [sessionId, isStreaming, input]);
+  // Auto-sync effect
+  useEffect(() => {
+    if (!selectedFile || !sessionId) return;
+    if (debouncedContent === lastSyncedContent.current) return;
+    saveFile(selectedFile, debouncedContent);
+  }, [debouncedContent, selectedFile, sessionId, saveFile]);
 
+  // Read file
+  const readFile = useCallback(
+    async (path: string) => {
+      if (!sessionId) return;
+      try {
+        const res = await fetch(`${apiBase}/api/file/read`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId, path }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setFileContent(data.content);
+          lastSyncedContent.current = data.content;
+        }
+      } catch {}
+    },
+    [apiBase, sessionId]
+  );
+
+  // Select file
+  const selectFile = useCallback(
+    async (path: string) => {
+      if (selectedFile && fileContent !== lastSyncedContent.current) {
+        await saveFile(selectedFile, fileContent);
+      }
+      setSelectedFile(path);
+      await readFile(path);
+    },
+    [selectedFile, fileContent, saveFile, readFile]
+  );
+
+  // Create file
+  const createFile = async () => {
+    if (!newFileName.trim() || !sessionId) return;
+    await saveFile(newFileName.trim(), "");
+    setSelectedFile(newFileName.trim());
+    setFileContent("");
+    lastSyncedContent.current = "";
+    setShowNewFile(false);
+    setNewFileName("");
+  };
+
+  // Load test file
+  const loadTestFile = async (key: string) => {
+    const tf = TEST_FILES[key];
+    if (!tf || !sessionId) return;
+    await saveFile(tf.name, tf.content);
+    setSelectedFile(tf.name);
+    setFileContent(tf.content);
+    lastSyncedContent.current = tf.content;
+  };
+
+  // Send chat message
   const sendMessage = async () => {
-    if (!sessionId || isStreaming) {
-      return;
-    }
+    if (!sessionId || isStreaming || !input.trim()) return;
 
-    const messagePayload = includeFile
-      ? promptWithFile(input, fileName, fileContent)
-      : input;
-
-    setMessages((prev) => [
-      ...prev,
-      { role: "user", content: input },
-      { role: "assistant", content: "" },
-    ]);
+    const userMessage = input.trim();
     setInput("");
+    setMessages((prev) => [...prev, { id: uid(), role: "user", content: userMessage }]);
     setIsStreaming(true);
     streamBuffer.current = "";
 
+    const assistantId = uid();
+    setMessages((prev) => [...prev, { id: assistantId, role: "assistant", content: "" }]);
+
     try {
-      const response = await fetch(`${apiBase}/api/message/stream`, {
+      const res = await fetch(`${apiBase}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: sessionId,
-          message: messagePayload,
-        }),
+        body: JSON.stringify({ session_id: sessionId, message: userMessage }),
       });
 
-      if (!response.ok || !response.body) {
-        throw new Error("Streaming request failed");
-      }
+      if (!res.ok || !res.body) throw new Error("Stream failed");
 
-      const reader = response.body.getReader();
+      const reader = res.body.getReader();
       const decoder = new TextDecoder();
 
       while (true) {
         const { value, done } = await reader.read();
-        if (done) {
-          break;
-        }
+        if (done) break;
+
         streamBuffer.current += decoder.decode(value, { stream: true });
-        streamBuffer.current = parseSseEvents(
-          streamBuffer.current,
-          (chunk) => {
-            setMessages((prev) => {
-              const next = [...prev];
-              const lastIndex = next.length - 1;
-              if (lastIndex >= 0 && next[lastIndex].role === "assistant") {
-                next[lastIndex] = {
-                  ...next[lastIndex],
-                  content: next[lastIndex].content + chunk,
-                };
-              }
-              return next;
-            });
+        streamBuffer.current = parseSseEvents(streamBuffer.current, {
+          onText: (text) => {
+            setMessages((prev) =>
+              prev.map((m) => (m.id === assistantId ? { ...m, content: m.content + text } : m))
+            );
           },
-          (payload) => {
-            try {
-              const data = JSON.parse(payload) as { diff?: string | null };
-              if (data.diff) {
-                setLastDiff(data.diff);
-              }
-            } catch {
-              // ignore parse failures
-            }
-          }
-        );
+          onToolCall: (name, args) => {
+            setMessages((prev) => [
+              ...prev,
+              { id: uid(), role: "tool", content: args, toolName: name },
+            ]);
+          },
+          onToolOutput: (output) => {
+            setMessages((prev) => [
+              ...prev,
+              { id: uid(), role: "tool", content: output, toolName: "result" },
+            ]);
+          },
+          onReasoning: (summary) => {
+            setMessages((prev) => [
+              ...prev,
+              { id: uid(), role: "reasoning", content: summary },
+            ]);
+          },
+          onDone: async () => {
+            // Refresh files after agent might have modified them
+            await refreshFiles();
+            if (selectedFile) await readFile(selectedFile);
+          },
+        });
       }
-    } catch (error) {
-      setMessages((prev) => [
-        ...prev.slice(0, -1),
-        {
-          role: "assistant",
-          content: "Streaming failed. Check the API server and try again.",
-        },
-      ]);
+    } catch {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantId ? { ...m, content: m.content + "\n\n[Error: Connection failed]" } : m
+        )
+      );
     } finally {
       setIsStreaming(false);
     }
   };
 
-  const approvePatch = async (approved: boolean) => {
-    if (!sessionId) {
-      return;
-    }
-    setIsStreaming(true);
-    try {
-      const response = await fetch(`${apiBase}/api/approve`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: sessionId,
-          approved,
-          reason: approved ? null : rejectionReason || "No reason provided.",
-        }),
-      });
-      if (!response.ok) {
-        throw new Error("Approval request failed");
-      }
-      const data = (await response.json()) as { text: string; diff?: string | null };
-      setMessages((prev) => [
-        ...prev,
-        {
+  // Bootstrap
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        setStatus("Creating session...");
+        const res = await fetch(`${apiBase}/api/session`, { method: "POST" });
+        if (!res.ok) throw new Error();
+        const data = await res.json();
+        if (!mounted) return;
+        setSessionId(data.session_id);
+        setStatus("Ready");
+
+        // Add welcome message
+        setMessages([{
+          id: uid(),
           role: "assistant",
-          content: data.text,
-        },
-      ]);
-      if (data.diff) {
-        setLastDiff(data.diff);
+          content: "Hi! I'm Sentinel-RAG, your IaC security assistant. Load a test file or create your own, then ask me to scan and fix security issues. Just say something like \"scan my terraform files\" to get started!"
+        }]);
+      } catch {
+        if (mounted) setStatus("Connection failed");
       }
-      setRejectionReason("");
-    } catch {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: "Approval request failed. Check the API server.",
-        },
-      ]);
-    } finally {
-      setIsStreaming(false);
-    }
-  };
+    })();
+    return () => { mounted = false; };
+  }, [apiBase]);
+
+  useEffect(() => {
+    if (sessionId) refreshFiles();
+  }, [sessionId, refreshFiles]);
 
   return (
-    <div className="min-h-screen bg-[radial-gradient(circle_at_top,_#f8efe2,_#f4f7f5_50%,_#f7f0e8_100%)] text-slate-900">
-      <div className="mx-auto flex min-h-screen max-w-6xl flex-col gap-8 px-6 py-10">
-        <header className="flex flex-col gap-3">
+    <div className="flex h-screen bg-[#1e1e1e] text-[#d4d4d4]">
+      {/* Left sidebar - Files */}
+      <aside
+        className="flex flex-col border-r border-[#2d2d2d] bg-[#252526]"
+        style={{ width: leftPaneWidth, minWidth: leftPaneWidth }}
+      >
+        <div className="border-b border-[#2d2d2d] p-3">
           <div className="flex items-center justify-between">
-            <div>
-              <p className="text-xs uppercase tracking-[0.3em] text-slate-500">
-                Sentinel-RAG
-              </p>
-              <h1 className="text-4xl font-semibold tracking-tight text-slate-900">
-                IaC Autofix Studio
-              </h1>
-            </div>
-            <div className="rounded-full border border-slate-200 bg-white/80 px-4 py-2 text-xs font-medium uppercase tracking-[0.2em] text-slate-600">
-              {status}
-            </div>
-          </div>
-          <p className="max-w-2xl text-base text-slate-600">
-            Paste IaC, discuss issues, and apply targeted diffs only after approval.
-            This is a local session backed by the Sentinel-RAG agent.
-          </p>
-        </header>
-
-        <section className="grid gap-6 lg:grid-cols-[1.1fr_1.5fr]">
-          <div className="rounded-3xl border border-slate-200/80 bg-white/90 p-6 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.35)]">
-            <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold text-slate-900">IaC Input</h2>
-              <label className="flex items-center gap-2 text-xs font-medium uppercase tracking-[0.2em] text-slate-500">
-                <input
-                  type="checkbox"
-                  checked={includeFile}
-                  onChange={(event) => setIncludeFile(event.target.checked)}
-                />
-                include
-              </label>
-            </div>
-            <div className="mt-4">
-              <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
-                File name
-              </label>
-              <input
-                className="mt-2 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
-                value={fileName}
-                onChange={(event) => setFileName(event.target.value)}
-              />
-            </div>
-            <div className="mt-4">
-              <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
-                File contents
-              </label>
-              <textarea
-                className="mt-2 h-64 w-full rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3 text-sm font-mono text-slate-700"
-                value={fileContent}
-                onChange={(event) => setFileContent(event.target.value)}
-                placeholder="Paste Terraform, CloudFormation, or K8s manifests here."
-              />
-            </div>
-            <div className="mt-4 rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500">
-              Session ID: {sessionId ?? "pending"}
-              <br />
-              API Base: {apiBase}
-            </div>
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-[#9da1a6]">
+              Files
+            </span>
+            <button
+              onClick={() => setShowNewFile(true)}
+              className="rounded px-2 py-0.5 text-xs text-[#9da1a6] hover:bg-[#3c3c3c] hover:text-white"
+            >
+              + New
+            </button>
           </div>
 
-          <div className="flex flex-col rounded-3xl border border-slate-200/80 bg-white/90 p-6 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.35)]">
-            <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold text-slate-900">Conversation</h2>
+          {showNewFile && (
+            <div className="mt-2 flex gap-1">
               <input
-                className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-500"
-                value={apiBase}
-                onChange={(event) => setApiBase(event.target.value)}
+                className="flex-1 rounded border border-[#3c3c3c] bg-[#1e1e1e] px-2 py-1 text-xs"
+                placeholder="filename.tf"
+                value={newFileName}
+                onChange={(e) => setNewFileName(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && createFile()}
+                autoFocus
               />
+              <button onClick={createFile} className="rounded bg-[#007acc] px-2 text-xs text-white">
+                OK
+              </button>
             </div>
-            <div className="mt-4 flex h-[420px] flex-col gap-4 overflow-y-auto rounded-2xl bg-gradient-to-b from-white to-slate-50 p-4">
-              {messages.length === 0 ? (
-                <div className="text-sm text-slate-500">
-                  Ask the agent to review or propose a fix. Example: "Read main.tf
-                  and propose a minimal diff to fix insecure settings."
-                </div>
-              ) : (
-                messages.map((message, index) => (
-                  <div
-                    key={`${message.role}-${index}`}
-                    className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-relaxed shadow-sm ${
-                      message.role === "user"
-                        ? "ml-auto bg-slate-900 text-white"
-                        : "bg-white text-slate-800"
-                    }`}
-                  >
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      components={{
-                        p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-                        code: ({ children }) => (
-                          <code className="rounded bg-slate-100 px-1 py-0.5 text-xs text-slate-800">
-                            {children}
-                          </code>
-                        ),
-                        pre: ({ children }) => (
-                          <pre className="mt-2 overflow-auto rounded-xl bg-slate-900 p-3 text-xs text-slate-100">
-                            {children}
-                          </pre>
-                        ),
-                        ul: ({ children }) => (
-                          <ul className="ml-4 list-disc space-y-1">{children}</ul>
-                        ),
-                        ol: ({ children }) => (
-                          <ol className="ml-4 list-decimal space-y-1">{children}</ol>
-                        ),
-                        a: ({ children, href }) => (
-                          <a className="text-emerald-600 underline" href={href}>
-                            {children}
-                          </a>
-                        ),
-                      }}
-                    >
-                      {message.content}
-                    </ReactMarkdown>
+          )}
+        </div>
+
+        <div className="flex-1 overflow-auto">
+          {fileTree.length === 0 ? (
+            <div className="p-3 text-xs text-[#9da1a6]">No files yet</div>
+          ) : (
+            <FileTree nodes={fileTree} selectedPath={selectedFile} onSelect={selectFile} />
+          )}
+        </div>
+
+        <div className="border-t border-[#2d2d2d] p-3">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-[#9da1a6] mb-2">
+            Test Files
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {Object.entries(TEST_FILES).map(([key, file]) => (
+              <button
+                key={key}
+                onClick={() => loadTestFile(key)}
+                className="rounded border border-[#3c3c3c] bg-[#1e1e1e] px-2 py-1 text-[10px] text-[#9da1a6] hover:bg-[#2a2a2a] hover:text-white"
+              >
+                {file.name}
+              </button>
+            ))}
+          </div>
+        </div>
+      </aside>
+
+      {/* Left resize divider */}
+      <ResizeDivider onDrag={handleLeftResize} direction="left" />
+
+      {/* Center - Editor */}
+      <main className="flex flex-1 flex-col min-w-0">
+        <div className="flex h-9 items-center border-b border-[#2d2d2d] bg-[#252526] px-4">
+          {selectedFile ? (
+            <span className="text-xs text-[#d4d4d4]">{selectedFile}</span>
+          ) : (
+            <span className="text-xs text-[#9da1a6]">No file selected</span>
+          )}
+        </div>
+        <div className="flex-1 p-2">
+          {selectedFile ? (
+            <textarea
+              className="h-full w-full resize-none rounded border border-[#2d2d2d] bg-[#1e1e1e] p-3 font-mono text-sm text-[#d4d4d4] outline-none focus:border-[#007acc]"
+              value={fileContent}
+              onChange={(e) => setFileContent(e.target.value)}
+              spellCheck={false}
+            />
+          ) : (
+            <div className="flex h-full items-center justify-center text-sm text-[#9da1a6]">
+              Create or select a file to edit
+            </div>
+          )}
+        </div>
+      </main>
+
+      {/* Right resize divider */}
+      <ResizeDivider onDrag={handleRightResize} direction="right" />
+
+      {/* Right - Chat */}
+      <aside
+        className="flex flex-col border-l border-[#2d2d2d] bg-[#252526]"
+        style={{ width: rightPaneWidth, minWidth: rightPaneWidth }}
+      >
+        <div className="flex h-9 items-center justify-between border-b border-[#2d2d2d] px-4">
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-[#9da1a6]">
+            Sentinel-RAG
+          </span>
+          <span className="text-[10px] text-[#9da1a6]">{status}</span>
+        </div>
+
+        <div className="flex-1 overflow-auto p-3 space-y-3">
+          {messages.map((m) => {
+            if (m.role === "reasoning") {
+              return (
+                <div key={m.id} className="rounded border border-[#4ec9b0]/30 bg-[#4ec9b0]/10 p-2">
+                  <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase text-[#4ec9b0] mb-1">
+                    <span className="inline-block w-2 h-2 rounded-full bg-[#4ec9b0] animate-pulse" />
+                    Thinking
                   </div>
-                ))
-              )}
-              {isStreaming && (
-                <div className="max-w-[85%] rounded-2xl border border-dashed border-slate-200 bg-white px-4 py-3 text-sm text-slate-500">
-                  Streaming response...
+                  <div className="text-[12px] text-[#4ec9b0]/80 italic whitespace-pre-wrap">
+                    {m.content}
+                  </div>
                 </div>
-              )}
-              <div ref={chatEndRef} />
-            </div>
-            <div className="mt-4 flex flex-col gap-3">
-              <textarea
-                className="h-28 w-full rounded-2xl border border-slate-200 bg-white px-3 py-3 text-sm"
-                value={input}
-                onChange={(event) => setInput(event.target.value)}
-                placeholder="Ask for findings, propose fixes, or request a diff."
-              />
-              <div className="flex flex-wrap gap-3">
-                <button
-                  className={`rounded-2xl px-4 py-3 text-sm font-semibold uppercase tracking-[0.2em] transition ${
-                    canSend
-                      ? "bg-slate-900 text-white hover:bg-slate-800"
-                      : "cursor-not-allowed bg-slate-200 text-slate-400"
-                  }`}
-                  onClick={sendMessage}
-                  disabled={!canSend}
-                >
-                  {isStreaming ? "Streaming..." : "Send"}
-                </button>
-                <button
-                  className={`rounded-2xl border border-emerald-200 px-4 py-3 text-xs font-semibold uppercase tracking-[0.2em] transition ${
-                    lastDiff && !isStreaming
-                      ? "bg-emerald-600 text-white hover:bg-emerald-500"
-                      : "cursor-not-allowed bg-emerald-50 text-emerald-300"
-                  }`}
-                  onClick={() => approvePatch(true)}
-                  disabled={!lastDiff || isStreaming}
-                >
-                  Approve
-                </button>
-                <button
-                  className={`rounded-2xl border border-rose-200 px-4 py-3 text-xs font-semibold uppercase tracking-[0.2em] transition ${
-                    lastDiff && !isStreaming
-                      ? "bg-rose-500 text-white hover:bg-rose-400"
-                      : "cursor-not-allowed bg-rose-50 text-rose-300"
-                  }`}
-                  onClick={() => approvePatch(false)}
-                  disabled={!lastDiff || isStreaming}
-                >
-                  Reject
-                </button>
+              );
+            }
+
+            if (m.role === "tool") {
+              return (
+                <div key={m.id} className="rounded border border-[#3c3c3c] bg-[#1e1e1e] p-2">
+                  <div className="text-[10px] font-semibold uppercase text-[#569cd6] mb-1">
+                    {m.toolName}
+                  </div>
+                  <pre className="text-[11px] text-[#9da1a6] whitespace-pre-wrap overflow-auto max-h-32">
+                    {m.content.slice(0, 500)}{m.content.length > 500 ? "..." : ""}
+                  </pre>
+                </div>
+              );
+            }
+
+            return (
+              <div
+                key={m.id}
+                className={`rounded-lg p-3 ${
+                  m.role === "user" ? "bg-[#094771] ml-8" : "bg-[#2d2d2d] mr-8"
+                }`}
+              >
+                <div className="prose prose-invert prose-sm max-w-none">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                </div>
               </div>
-              <input
-                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-500"
-                value={rejectionReason}
-                onChange={(event) => setRejectionReason(event.target.value)}
-                placeholder="Rejection reason (optional)"
-              />
-            </div>
+            );
+          })}
+          {isStreaming && (
+            <div className="text-xs text-[#9da1a6] animate-pulse">Thinking...</div>
+          )}
+          <div ref={chatEndRef} />
+        </div>
+
+        <div className="border-t border-[#2d2d2d] p-3">
+          <textarea
+            className="w-full resize-none rounded border border-[#2d2d2d] bg-[#1e1e1e] p-2 text-sm text-[#d4d4d4] outline-none focus:border-[#007acc]"
+            rows={3}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+              }
+            }}
+            placeholder="Ask me to scan and fix your IaC files..."
+            disabled={isStreaming}
+          />
+          <div className="mt-2 flex justify-between items-center">
+            <span className="text-[10px] text-[#9da1a6]">Enter to send</span>
+            <button
+              onClick={sendMessage}
+              disabled={isStreaming || !input.trim()}
+              className="rounded bg-[#007acc] px-4 py-1.5 text-xs font-medium text-white hover:bg-[#1385d3] disabled:opacity-50"
+            >
+              Send
+            </button>
           </div>
-        </section>
-        {lastDiff && (
-          <section className="rounded-3xl border border-slate-200/80 bg-white/90 p-6 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.35)]">
-            <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold text-slate-900">Latest Diff</h2>
-              <span className="text-xs uppercase tracking-[0.2em] text-slate-500">
-                pending approval
-              </span>
-            </div>
-            <pre className="mt-4 max-h-80 overflow-auto rounded-2xl bg-slate-900 p-4 text-xs text-emerald-100">
-              {lastDiff}
-            </pre>
-          </section>
-        )}
-      </div>
+        </div>
+      </aside>
     </div>
   );
 }
