@@ -14,7 +14,7 @@ IaC security scanning + autofix assistant with a per‑user sandbox, a chat UI, 
 
 ## What it does
 
-- Creates a **per‑session sandbox** (an empty workspace) where users upload IaC files.
+- Creates a **per‑session sandbox** (an empty workspace) where users create and edit IaC files directly in a VS Code‑style editor.
 - Runs **IaC scans** (currently Checkov + tflint where applicable).
 - Lets the agent propose fixes and apply them via an `apply_patch` tool.
 - Shows file edits in a **VS Code‑style diff viewer** (Monaco) and keeps tool/thinking output expandable in the chat.
@@ -93,8 +93,8 @@ If Checkov is not found on PATH, the backend tries:
 ## Sandbox model
 
 - Each chat session gets its own sandbox directory under `.sentinel/sandboxes/`.
-- The sandbox starts **empty**; the user uploads files into it via the UI/API.
-- Tools (read/list/apply_patch/scan) are scoped to that sandbox root to avoid touching the app’s source tree.
+- The sandbox starts **empty**; users create files directly in the VS Code‑style editor or load test templates.
+- Tools (read/list/apply_patch/scan) are scoped to that sandbox root to avoid touching the app's source tree.
 
 ## Troubleshooting
 
