@@ -163,6 +163,7 @@ const parseSseEvents = (
     onText: (text: string) => void;
     onToolCall: (payload: { name: string; args: string; callId?: string }) => void;
     onToolOutput: (payload: { output: string; callId?: string }) => void;
+    onToolStatus: (payload: { name?: string; status: "running" | "done"; callId?: string }) => void;
     onReasoning: (summary: string) => void;
     onDone: (payload?: { final_output?: string; last_response_id?: string }) => void;
   }
@@ -195,9 +196,13 @@ const parseSseEvents = (
     } else if (eventName === "tool_called") {
       try {
         const payload = JSON.parse(data);
+        const args =
+          typeof payload.arguments === "string"
+            ? payload.arguments
+            : JSON.stringify(payload.arguments ?? "", null, 2);
         handlers.onToolCall({
           name: payload.name || "tool",
-          args: payload.arguments || "",
+          args,
           callId: payload.call_id || undefined,
         });
       } catch {}
@@ -209,6 +214,16 @@ const parseSseEvents = (
           : JSON.stringify(payload.output, null, 2);
         handlers.onToolOutput({
           output,
+          callId: payload.call_id || undefined,
+        });
+      } catch {}
+    } else if (eventName === "tool_status") {
+      try {
+        const payload = JSON.parse(data);
+        const status = payload.status === "running" ? "running" : "done";
+        handlers.onToolStatus({
+          name: payload.name || undefined,
+          status,
           callId: payload.call_id || undefined,
         });
       } catch {}
@@ -611,6 +626,42 @@ export default function Home() {
                   : m
               )
             );
+          },
+          onToolStatus: ({ name, status, callId }) => {
+            const key = callId;
+            const existingId = key ? toolMessageIdsByCallId.current.get(key) : undefined;
+
+            if (existingId) {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === existingId ? { ...m, toolStatus: status } : m
+                )
+              );
+              return;
+            }
+
+            // Fallback: hosted tools may emit status events with IDs that don't match the original
+            // tool_called event. Prefer updating the most recent running web_search card.
+            if (name === "web_search") {
+              setMessages((prev) => {
+                const idx = [...prev]
+                  .map((m, i) => ({ m, i }))
+                  .reverse()
+                  .find(({ m }) => m.role === "tool" && m.toolName === "web_search" && m.toolStatus === "running")
+                  ?.i;
+                if (idx === undefined) return prev;
+
+                const next = prev.slice();
+                const updated = { ...next[idx], toolStatus: status };
+                next[idx] = updated;
+
+                if (key) {
+                  toolMessageIdsByCallId.current.set(key, updated.id);
+                  toolNamesByCallId.current.set(key, "web_search");
+                }
+                return next;
+              });
+            }
           },
           onReasoning: (summary) => {
             setMessages((prev) => [

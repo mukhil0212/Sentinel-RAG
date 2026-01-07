@@ -108,6 +108,28 @@ def _sse_json(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\n" + _sse_data(json.dumps(payload, default=str))
 
 
+def _get_call_id(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw.get("call_id") or raw.get("id")
+    return getattr(raw, "call_id", None) or getattr(raw, "id", None)
+
+
+def _get_arguments(raw: Any) -> Any:
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw.get("arguments") or raw.get("operation") or raw.get("action")
+    args = getattr(raw, "arguments", None)
+    if args is not None:
+        return args
+    action = getattr(raw, "action", None)
+    if hasattr(action, "model_dump"):
+        return action.model_dump(exclude_unset=True)
+    return action
+
+
 def _derive_tool_name(raw_type: str | None, name: str | None) -> str | None:
     """Derive tool name from type if not explicitly provided."""
     if name:
@@ -129,16 +151,16 @@ def _tool_call_payload(item: ToolCallItem) -> dict[str, Any]:
         return {
             "type": raw_type,
             "name": name,
-            "call_id": raw.get("call_id"),
-            "arguments": raw.get("arguments"),
+            "call_id": _get_call_id(raw),
+            "arguments": _get_arguments(raw),
         }
     raw_type = getattr(raw, "type", None)
     name = _derive_tool_name(raw_type, getattr(raw, "name", None))
     return {
         "type": raw_type,
         "name": name,
-        "call_id": getattr(raw, "call_id", None),
-        "arguments": getattr(raw, "arguments", None),
+        "call_id": _get_call_id(raw),
+        "arguments": _get_arguments(raw),
     }
 
 
@@ -217,15 +239,29 @@ async def chat(payload: MessageRequest) -> StreamingResponse:
                 event_data = event.data
                 event_type = None
                 delta = None
+                item_id = None
                 if isinstance(event_data, dict):
                     event_type = event_data.get("type")
                     delta = event_data.get("delta")
+                    item_id = event_data.get("item_id") or event_data.get("id")
                 else:
                     event_type = getattr(event_data, "type", None)
                     delta = getattr(event_data, "delta", None)
+                    item_id = getattr(event_data, "item_id", None) or getattr(event_data, "id", None)
 
                 if event_type == "response.output_text.delta" and isinstance(delta, str):
                     yield _sse_data(delta)
+                elif event_type == "response.web_search_call.completed" and item_id:
+                    # Hosted web search does not return results as a tool output payload. Emit a
+                    # status update so the frontend can flip the existing tool card to "done".
+                    yield _sse_json(
+                        "tool_status",
+                        {
+                            "call_id": item_id,
+                            "name": "web_search",
+                            "status": "done",
+                        },
+                    )
 
             elif isinstance(event, RunItemStreamEvent):
                 if event.name == "tool_called" and isinstance(event.item, ToolCallItem):
