@@ -83,7 +83,7 @@ def build_agent(sandbox_root: Path, instructions: str = DEFAULT_INSTRUCTIONS) ->
         model="gpt-5.2",
         model_settings=ModelSettings(
             reasoning={
-                "effort": "medium",
+                "effort": "low",
                 "summary": "auto",  # Enable reasoning summaries
             }
         ),
