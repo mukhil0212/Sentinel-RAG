@@ -103,7 +103,7 @@ If Checkov is not found on PATH, the backend tries:
 
 ## Currently working
 
-We’re working on integrating company best practices so the agent proposes fixes that match “how we do things here”, not generic advice:
+I am working on integrating company best practices so the agent proposes fixes that match “how we do things here”, not generic advice:
 
 - **Bring your standards into the assistant**: connect internal docs (runbooks, guidelines, exceptions, and patterns) so the agent can reference them while suggesting changes.
 - **Context‑aware recommendations**: tailor suggestions to your environment and conventions (team/repo/project) instead of one‑size‑fits‑all outputs.
